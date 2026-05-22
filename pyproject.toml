@@ -1,0 +1,6 @@
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["plugins/memory", "/home/john/.hermes/hermes-agent"]
+
+[tool.ruff]
+line-length = 120

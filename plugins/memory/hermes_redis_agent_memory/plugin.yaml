@@ -1,0 +1,5 @@
+name: redis-agent-memory
+version: 0.1.0
+description: "Redis Agent Memory Server provider for Hermes Agent: Redis-backed working and long-term memory with hybrid search."
+pip_dependencies:
+  - redis-agent-memory

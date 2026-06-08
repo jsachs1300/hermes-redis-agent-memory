@@ -9,6 +9,7 @@ search / forget tools, and mirroring of built-in Hermes memory writes.
 from __future__ import annotations
 
 import json
+import hashlib
 import logging
 import os
 import re
@@ -326,6 +327,12 @@ FORGET_SCHEMA = {
     },
 }
 
+STATUS_SCHEMA = {
+    "name": "redis_memory_status",
+    "description": "Show Redis Agent Memory provider health, scope, and pending write status.",
+    "parameters": {"type": "object", "properties": {}},
+}
+
 
 class RedisAgentMemoryProvider(MemoryProvider):
     """Hermes memory provider backed by Redis Agent Memory Server."""
@@ -385,7 +392,7 @@ class RedisAgentMemoryProvider(MemoryProvider):
             logger.warning("Redis Agent Memory health check failed; provider disabled: %s", exc)
             self._client = None
             return
-        self._flush_pending_writes_async()
+        self._flush_pending_writes()
 
     def get_config_schema(self):
         return [
@@ -463,6 +470,62 @@ class RedisAgentMemoryProvider(MemoryProvider):
                 "last_error TEXT DEFAULT ''"
                 ")"
             )
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS mirrored_memory_map ("
+                "target TEXT NOT NULL, "
+                "content_hash TEXT NOT NULL, "
+                "memory_id TEXT NOT NULL, "
+                "created_at TEXT NOT NULL, "
+                "PRIMARY KEY(target, content_hash)"
+                ")"
+            )
+
+    @staticmethod
+    def _content_hash(content: str) -> str:
+        return hashlib.sha256(content.strip().encode("utf-8")).hexdigest()
+
+    def _remember_mirrored_memory_id(self, target: str, content: str, memory_id: str) -> None:
+        if not self._queue_path or not content or not memory_id:
+            return
+        self._ensure_queue()
+        with sqlite3.connect(self._queue_path) as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO mirrored_memory_map(target, content_hash, memory_id, created_at) "
+                "VALUES (?, ?, ?, ?)",
+                (target, self._content_hash(content), memory_id, datetime.now(timezone.utc).isoformat()),
+            )
+
+    def _lookup_mirrored_memory_id(self, target: str, content: str) -> str:
+        if not self._queue_path or not content:
+            return ""
+        self._ensure_queue()
+        with sqlite3.connect(self._queue_path) as conn:
+            row = conn.execute(
+                "SELECT memory_id FROM mirrored_memory_map WHERE target = ? AND content_hash = ?",
+                (target, self._content_hash(content)),
+            ).fetchone()
+        return str(row[0]) if row else ""
+
+    def _forget_mirrored_memory_id(self, target: str, content: str) -> str:
+        if not self._queue_path or not content:
+            return ""
+        memory_id = self._lookup_mirrored_memory_id(target, content)
+        if not memory_id:
+            return ""
+        with sqlite3.connect(self._queue_path) as conn:
+            conn.execute(
+                "DELETE FROM mirrored_memory_map WHERE target = ? AND content_hash = ?",
+                (target, self._content_hash(content)),
+            )
+        return memory_id
+
+    def _pending_write_count(self) -> int:
+        if not self._queue_path or not self._queue_path.exists():
+            return 0
+        self._ensure_queue()
+        with sqlite3.connect(self._queue_path) as conn:
+            row = conn.execute("SELECT COUNT(*) FROM working_memory_queue").fetchone()
+        return int(row[0] or 0)
 
     def _enqueue_working_memory(self, session_id: str, payload: dict) -> None:
         if not self._queue_path:
@@ -652,6 +715,39 @@ class RedisAgentMemoryProvider(MemoryProvider):
         self._sync_threads.append(thread)
         thread.start()
 
+    @staticmethod
+    def _created_memory_ids(response: Any) -> list[str]:
+        if isinstance(response, dict):
+            for key in ("created", "memory_ids", "ids"):
+                value = response.get(key)
+                if isinstance(value, list):
+                    return [str(v) for v in value]
+            memories = response.get("memories") or response.get("records") or []
+            if isinstance(memories, list):
+                ids = []
+                for item in memories:
+                    if isinstance(item, dict) and item.get("id"):
+                        ids.append(str(item["id"]))
+                return ids
+        return []
+
+    @staticmethod
+    def _provenance_topics(target: str, metadata: Optional[Dict[str, Any]]) -> list[str]:
+        topics = ["hermes", target or "memory"]
+        metadata = metadata or {}
+        additions = []
+        if metadata.get("write_origin"):
+            additions.append(f"origin:{metadata['write_origin']}")
+        if metadata.get("session_id"):
+            additions.append(f"session:{metadata['session_id']}")
+        if metadata.get("platform"):
+            additions.append(f"platform:{metadata['platform']}")
+        for topic in additions:
+            sanitized = re.sub(r"[^a-zA-Z0-9_.:-]", "-", str(topic))[:100]
+            if sanitized and sanitized not in topics:
+                topics.append(sanitized)
+        return topics
+
     def _create_memory(self, content: str, *, memory_type: str = "semantic", topics: Optional[list[str]] = None,
                        entities: Optional[list[str]] = None) -> dict:
         if not self._client:
@@ -675,13 +771,66 @@ class RedisAgentMemoryProvider(MemoryProvider):
         return self._client.create_long_term_memory([memory])
 
     def on_memory_write(self, action: str, target: str, content: str, metadata: Optional[Dict[str, Any]] = None) -> None:
-        if action != "add" or not content or not self._client or not self._writes_enabled:
+        if not self._client or not self._writes_enabled:
             return
-        topics = ["hermes", target or "memory"]
+        metadata = metadata or {}
+
+        def _delete_mirror(old_content: str) -> None:
+            memory_id = self._forget_mirrored_memory_id(target or "memory", old_content)
+            if memory_id:
+                logger.info("Redis Agent Memory delete mirrored memory request: memory_id=%s", memory_id)
+                self._client.delete_long_term_memories([memory_id])
+
+        if action == "remove":
+            if not content:
+                return
+
+            def _remove() -> None:
+                try:
+                    _delete_mirror(content)
+                except Exception as exc:
+                    logger.warning("Redis Agent Memory mirror remove failed: %s", exc)
+
+            thread = threading.Thread(target=_remove, daemon=True, name="redis-agent-memory-mirror-remove")
+            self._sync_threads.append(thread)
+            thread.start()
+            return
+
+        if action == "replace":
+            if not content:
+                return
+            old_content = str(metadata.get("old_text") or metadata.get("old_content") or "")
+
+            def _replace() -> None:
+                try:
+                    if old_content:
+                        _delete_mirror(old_content)
+                    response = self._create_memory(
+                        content,
+                        memory_type="semantic",
+                        topics=self._provenance_topics(target or "memory", metadata),
+                    )
+                    ids = self._created_memory_ids(response)
+                    if ids:
+                        self._remember_mirrored_memory_id(target or "memory", content, ids[0])
+                except Exception as exc:
+                    logger.warning("Redis Agent Memory mirror replace failed: %s", exc)
+
+            thread = threading.Thread(target=_replace, daemon=True, name="redis-agent-memory-mirror-replace")
+            self._sync_threads.append(thread)
+            thread.start()
+            return
+
+        if action != "add" or not content:
+            return
+        topics = self._provenance_topics(target or "memory", metadata)
 
         def _sync():
             try:
-                self._create_memory(content, memory_type="semantic", topics=topics)
+                response = self._create_memory(content, memory_type="semantic", topics=topics)
+                ids = self._created_memory_ids(response)
+                if ids:
+                    self._remember_mirrored_memory_id(target or "memory", content, ids[0])
             except Exception as exc:
                 logger.warning("Redis Agent Memory mirror failed: %s", exc)
 
@@ -690,7 +839,7 @@ class RedisAgentMemoryProvider(MemoryProvider):
         thread.start()
 
     def get_tool_schemas(self) -> List[Dict[str, Any]]:
-        return [SEARCH_SCHEMA, REMEMBER_SCHEMA, FORGET_SCHEMA]
+        return [SEARCH_SCHEMA, REMEMBER_SCHEMA, FORGET_SCHEMA, STATUS_SCHEMA]
 
     def on_session_switch(
         self,
@@ -752,6 +901,21 @@ class RedisAgentMemoryProvider(MemoryProvider):
                 return json.dumps({"deleted": deleted, "response": response})
             except Exception as exc:
                 return tool_error(f"Redis Agent Memory forget failed: {exc}")
+
+        if tool_name == "redis_memory_status":
+            return json.dumps({
+                "provider": self.name,
+                "configured": bool(self._config.get("base_url")),
+                "healthy": bool(self._client) and not self._last_health_error,
+                "last_health_error": self._last_health_error,
+                "user_id": self._user_id,
+                "namespace": self._namespace,
+                "auto_recall": bool(self._config.get("auto_recall", True)),
+                "auto_sync_turns": bool(self._config.get("auto_sync_turns", True)),
+                "writes_enabled": self._writes_enabled,
+                "pending_writes": self._pending_write_count(),
+                "circuit_open": self._is_circuit_open(),
+            })
 
         return tool_error(f"Unknown tool: {tool_name}")
 

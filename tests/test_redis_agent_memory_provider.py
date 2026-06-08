@@ -45,7 +45,7 @@ class FakeMemoryClient:
 
     def create_long_term_memory(self, memories):
         self.created.extend(memories)
-        return {"memory_ids": [f"m{idx}" for idx, _ in enumerate(memories, start=10)]}
+        return {"created": [f"m{idx}" for idx, _ in enumerate(memories, start=10)]}
 
     def put_working_memory(self, session_id, working_memory):
         self.working_memory_puts.append((session_id, working_memory))
@@ -359,3 +359,74 @@ def test_failed_working_memory_writes_are_replayed_from_durable_queue(tmp_path):
     session_id, payload = succeeding.working_memory_puts[0]
     assert session_id == "session-1"
     assert payload["messages"][0]["content"] == "hello"
+
+
+def test_status_tool_reports_scope_health_and_queue(tmp_path):
+    from hermes_redis_agent_memory import RedisAgentMemoryProvider
+
+    fake = FakeMemoryClient()
+    provider = RedisAgentMemoryProvider(client_factory=lambda config: fake)
+    provider.initialize("session-1", hermes_home=str(tmp_path), user_id="john")
+
+    result = json.loads(provider.handle_tool_call("redis_memory_status", {}))
+
+    assert result["provider"] == "redis-agent-memory"
+    assert result["configured"] is True
+    assert result["healthy"] is True
+    assert result["user_id"] == "john"
+    assert result["namespace"] == "hermes"
+    assert result["pending_writes"] == 0
+
+
+def test_memory_write_add_preserves_provenance_topics_and_mapping(tmp_path):
+    from hermes_redis_agent_memory import RedisAgentMemoryProvider
+
+    fake = FakeMemoryClient()
+    provider = RedisAgentMemoryProvider(client_factory=lambda config: fake)
+    provider.initialize("session-1", hermes_home=str(tmp_path), user_id="john")
+
+    provider.on_memory_write(
+        "add",
+        "user",
+        "John prefers concise answers.",
+        metadata={"write_origin": "tool", "session_id": "session-1", "platform": "cli"},
+    )
+    provider.shutdown()
+
+    memory = fake.created[-1]
+    assert memory["topics"] == ["hermes", "user", "origin:tool", "session:session-1", "platform:cli"]
+    assert provider._lookup_mirrored_memory_id("user", "John prefers concise answers.") == "m10"
+
+
+def test_memory_write_replace_deletes_old_mapping_and_creates_new_memory(tmp_path):
+    from hermes_redis_agent_memory import RedisAgentMemoryProvider
+
+    fake = FakeMemoryClient()
+    provider = RedisAgentMemoryProvider(client_factory=lambda config: fake)
+    provider.initialize("session-1", hermes_home=str(tmp_path), user_id="john")
+    provider.on_memory_write("add", "user", "old fact")
+    provider.shutdown()
+
+    provider.on_memory_write("replace", "user", "new fact", metadata={"old_text": "old fact"})
+    provider.shutdown()
+
+    assert "m10" in fake.deleted
+    assert fake.created[-1]["text"] == "new fact"
+    assert provider._lookup_mirrored_memory_id("user", "old fact") == ""
+    assert provider._lookup_mirrored_memory_id("user", "new fact") == "m10"
+
+
+def test_memory_write_remove_deletes_mapped_memory(tmp_path):
+    from hermes_redis_agent_memory import RedisAgentMemoryProvider
+
+    fake = FakeMemoryClient()
+    provider = RedisAgentMemoryProvider(client_factory=lambda config: fake)
+    provider.initialize("session-1", hermes_home=str(tmp_path), user_id="john")
+    provider.on_memory_write("add", "memory", "temporary fact")
+    provider.shutdown()
+
+    provider.on_memory_write("remove", "memory", "temporary fact")
+    provider.shutdown()
+
+    assert "m10" in fake.deleted
+    assert provider._lookup_mirrored_memory_id("memory", "temporary fact") == ""

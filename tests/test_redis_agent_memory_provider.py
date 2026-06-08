@@ -17,9 +17,13 @@ class FakeMemoryClient:
         self.working_memory_puts = []
         self.deleted = []
         self.fail_working_memory = False
+        self.fail_search = False
+        self.fail_health = False
 
     def search_long_term_memory(self, **kwargs):
         self.search_calls.append(kwargs)
+        if self.fail_search:
+            raise RuntimeError("simulated search failure")
         return {
             "memories": [
                 {
@@ -54,6 +58,8 @@ class FakeMemoryClient:
         return {"deleted": len(memory_ids)}
 
     def health(self):
+        if self.fail_health:
+            raise RuntimeError("simulated health failure")
         return {"status": "ok"}
 
     def get_long_term_memory(self, memory_id):
@@ -285,3 +291,71 @@ def test_search_mode_is_forwarded_to_client(tmp_path):
     provider.handle_tool_call("redis_memory_search", {"query": "redis", "search_mode": "keyword"})
 
     assert fake.search_calls[-1]["search_mode"] == "keyword"
+
+
+def test_initialize_disables_client_when_health_check_fails(tmp_path):
+    from hermes_redis_agent_memory import RedisAgentMemoryProvider
+
+    fake = FakeMemoryClient()
+    fake.fail_health = True
+    provider = RedisAgentMemoryProvider(client_factory=lambda config: fake)
+
+    provider.initialize("session-1", hermes_home=str(tmp_path), user_id="john")
+
+    assert provider._client is None
+    assert provider._last_health_error == "simulated health failure"
+
+
+def test_queue_prefetch_caches_next_turn_result(tmp_path):
+    from hermes_redis_agent_memory import RedisAgentMemoryProvider
+
+    fake = FakeMemoryClient()
+    provider = RedisAgentMemoryProvider(client_factory=lambda config: fake)
+    provider.initialize("session-1", hermes_home=str(tmp_path), user_id="john")
+
+    provider.queue_prefetch("redis", session_id="session-1")
+    provider.shutdown()
+    block = provider.prefetch("ignored", session_id="session-1")
+
+    assert "John works at Redis" in block
+    assert fake.search_calls[0]["text"] == "redis"
+
+
+def test_circuit_breaker_opens_after_repeated_search_failures(tmp_path):
+    from hermes_redis_agent_memory import RedisAgentMemoryProvider
+
+    fake = FakeMemoryClient()
+    fake.fail_search = True
+    provider = RedisAgentMemoryProvider(client_factory=lambda config: fake)
+    provider.initialize("session-1", hermes_home=str(tmp_path), user_id="john")
+
+    for _ in range(3):
+        provider.handle_tool_call("redis_memory_search", {"query": "redis"})
+    before = len(fake.search_calls)
+    result = json.loads(provider.handle_tool_call("redis_memory_search", {"query": "redis"}))
+
+    assert len(fake.search_calls) == before
+    assert "temporarily unavailable" in result["error"]
+
+
+def test_failed_working_memory_writes_are_replayed_from_durable_queue(tmp_path):
+    from hermes_redis_agent_memory import RedisAgentMemoryProvider
+
+    failing = FakeMemoryClient()
+    failing.fail_working_memory = True
+    provider = RedisAgentMemoryProvider(client_factory=lambda config: failing)
+    provider.initialize("session-1", hermes_home=str(tmp_path), user_id="john")
+    provider.sync_turn("hello", "hi", session_id="session-1")
+    provider.shutdown()
+
+    assert failing.working_memory_puts == [("session-1", failing.working_memory_puts[0][1])]
+
+    succeeding = FakeMemoryClient()
+    provider2 = RedisAgentMemoryProvider(client_factory=lambda config: succeeding)
+    provider2.initialize("session-1", hermes_home=str(tmp_path), user_id="john")
+    provider2.shutdown()
+
+    assert len(succeeding.working_memory_puts) == 1
+    session_id, payload = succeeding.working_memory_puts[0]
+    assert session_id == "session-1"
+    assert payload["messages"][0]["content"] == "hello"

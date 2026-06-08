@@ -12,7 +12,9 @@ import json
 import logging
 import os
 import re
+import sqlite3
 import threading
+import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -34,6 +36,9 @@ _DEFAULT_USER_ID = "hermes-user"
 _DEFAULT_SEARCH_MODE = "hybrid"
 _VALID_SEARCH_MODES = {"semantic", "keyword", "hybrid"}
 _CONFIG_FILENAME = "redis-agent-memory.json"
+_QUEUE_FILENAME = "redis-agent-memory-queue.db"
+_CIRCUIT_FAILURE_THRESHOLD = 3
+_CIRCUIT_COOLDOWN_SECS = 120
 
 
 def _as_bool(value: Any, default: bool) -> bool:
@@ -335,7 +340,13 @@ class RedisAgentMemoryProvider(MemoryProvider):
         self._namespace = _DEFAULT_NAMESPACE
         self._writes_enabled = True
         self._prefetch_results: dict[str, str] = {}
+        self._prefetch_thread: Optional[threading.Thread] = None
         self._sync_threads: list[threading.Thread] = []
+        self._queue_path: Optional[Path] = None
+        self._queue_lock = threading.Lock()
+        self._failure_count = 0
+        self._circuit_opened_at = 0.0
+        self._last_health_error = ""
 
     @property
     def name(self) -> str:
@@ -361,9 +372,20 @@ class RedisAgentMemoryProvider(MemoryProvider):
         self._user_id = str(kwargs.get("user_id") or self._config.get("user_id") or _DEFAULT_USER_ID)
         self._config["namespace"] = self._namespace
         self._config["user_id"] = self._user_id
+        self._queue_path = Path(hermes_home or ".") / _QUEUE_FILENAME
         logged_config = {k: ("<set>" if k == "auth_token" and v else v) for k, v in self._config.items()}
         logger.info("Redis Agent Memory provider initializing: session_id=%s config=%s", session_id, logged_config)
         self._client = self._client_factory(self._config)
+        try:
+            self._client.health()
+            self._last_health_error = ""
+            self._record_success()
+        except Exception as exc:
+            self._last_health_error = str(exc)
+            logger.warning("Redis Agent Memory health check failed; provider disabled: %s", exc)
+            self._client = None
+            return
+        self._flush_pending_writes_async()
 
     def get_config_schema(self):
         return [
@@ -409,9 +431,103 @@ class RedisAgentMemoryProvider(MemoryProvider):
             "Use redis_memory_search for relevant recall and redis_memory_remember for explicit durable facts."
         )
 
+    def _is_circuit_open(self) -> bool:
+        if self._failure_count < _CIRCUIT_FAILURE_THRESHOLD:
+            return False
+        if time.monotonic() - self._circuit_opened_at < _CIRCUIT_COOLDOWN_SECS:
+            return True
+        self._failure_count = 0
+        self._circuit_opened_at = 0.0
+        return False
+
+    def _record_success(self) -> None:
+        self._failure_count = 0
+        self._circuit_opened_at = 0.0
+
+    def _record_failure(self) -> None:
+        self._failure_count += 1
+        if self._failure_count >= _CIRCUIT_FAILURE_THRESHOLD and not self._circuit_opened_at:
+            self._circuit_opened_at = time.monotonic()
+
+    def _ensure_queue(self) -> None:
+        if not self._queue_path:
+            return
+        self._queue_path.parent.mkdir(parents=True, exist_ok=True)
+        with sqlite3.connect(self._queue_path) as conn:
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS working_memory_queue ("
+                "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+                "session_id TEXT NOT NULL, "
+                "payload TEXT NOT NULL, "
+                "created_at TEXT NOT NULL, "
+                "last_error TEXT DEFAULT ''"
+                ")"
+            )
+
+    def _enqueue_working_memory(self, session_id: str, payload: dict) -> None:
+        if not self._queue_path:
+            return
+        self._ensure_queue()
+        with sqlite3.connect(self._queue_path) as conn:
+            conn.execute(
+                "INSERT INTO working_memory_queue(session_id, payload, created_at) VALUES (?, ?, ?)",
+                (session_id, json.dumps(payload), datetime.now(timezone.utc).isoformat()),
+            )
+
+    def _flush_pending_writes(self) -> None:
+        if not self._client or not self._queue_path:
+            return
+        with self._queue_lock:
+            self._ensure_queue()
+            with sqlite3.connect(self._queue_path) as conn:
+                rows = conn.execute(
+                    "SELECT id, session_id, payload FROM working_memory_queue ORDER BY id ASC"
+                ).fetchall()
+                for row_id, session_id, payload_json in rows:
+                    payload = json.loads(payload_json)
+                    try:
+                        self._client.put_working_memory(session_id, payload)
+                        conn.execute("DELETE FROM working_memory_queue WHERE id = ?", (row_id,))
+                        self._record_success()
+                    except Exception as exc:
+                        self._record_failure()
+                        conn.execute(
+                            "UPDATE working_memory_queue SET last_error = ? WHERE id = ?",
+                            (str(exc), row_id),
+                        )
+                        logger.warning(
+                            "Redis Agent Memory sync failed; queued for retry: %s; request: %s",
+                            exc,
+                            _sync_payload_log_details(payload),
+                        )
+                        break
+
+    def _flush_pending_writes_async(self) -> None:
+        thread = threading.Thread(target=self._flush_pending_writes, daemon=True, name="redis-agent-memory-queue-flush")
+        self._sync_threads.append(thread)
+        thread.start()
+
+    def _format_memories(self, memories: list[dict]) -> str:
+        if not memories:
+            return ""
+        lines = []
+        for memory in memories:
+            bits = []
+            if memory.get("memory_type"):
+                bits.append(str(memory["memory_type"]))
+            topics = memory.get("topics") or []
+            if topics:
+                bits.append(",".join(str(t) for t in topics[:3]))
+            prefix = f"[{'; '.join(bits)}] " if bits else ""
+            lines.append(f"- {prefix}{memory['text']}")
+        intro = "Relevant long-term memories from Redis Agent Memory Server. Use silently when helpful; do not force them into the conversation."
+        return "<redis-agent-memory-context>\n" + intro + "\n" + "\n".join(lines) + "\n</redis-agent-memory-context>"
+
     def _search(self, query: str, *, limit: Optional[int] = None, search_mode: Optional[str] = None) -> list[dict]:
         if not self._client or not query:
             return []
+        if self._is_circuit_open():
+            raise RuntimeError("Redis Agent Memory is temporarily unavailable after repeated failures")
         mode = (search_mode or self._config.get("search_mode") or _DEFAULT_SEARCH_MODE).lower()
         if mode not in _VALID_SEARCH_MODES:
             mode = _DEFAULT_SEARCH_MODE
@@ -423,13 +539,18 @@ class RedisAgentMemoryProvider(MemoryProvider):
             self._user_id,
             self._namespace,
         )
-        response = self._client.search_long_term_memory(
-            text=query,
-            limit=limit or self._config.get("max_recall_results", 8),
-            search_mode=mode,
-            user_id=self._user_id,
-            namespace=self._namespace,
-        )
+        try:
+            response = self._client.search_long_term_memory(
+                text=query,
+                limit=limit or self._config.get("max_recall_results", 8),
+                search_mode=mode,
+                user_id=self._user_id,
+                namespace=self._namespace,
+            )
+            self._record_success()
+        except Exception:
+            self._record_failure()
+            raise
         if isinstance(response, dict):
             memories = response.get("memories") or response.get("results") or response.get("items") or []
         else:
@@ -461,6 +582,10 @@ class RedisAgentMemoryProvider(MemoryProvider):
         return normalized
 
     def prefetch(self, query: str, *, session_id: str = "") -> str:
+        cache_key = session_id or self._session_id
+        cached = self._prefetch_results.pop(cache_key, "") if cache_key else ""
+        if cached:
+            return cached
         if not self._config.get("auto_recall", True):
             return ""
         try:
@@ -468,20 +593,28 @@ class RedisAgentMemoryProvider(MemoryProvider):
         except Exception as exc:
             logger.debug("Redis Agent Memory prefetch failed: %s", exc)
             return ""
-        if not memories:
-            return ""
-        lines = []
-        for memory in memories:
-            bits = []
-            if memory.get("memory_type"):
-                bits.append(str(memory["memory_type"]))
-            topics = memory.get("topics") or []
-            if topics:
-                bits.append(",".join(str(t) for t in topics[:3]))
-            prefix = f"[{'; '.join(bits)}] " if bits else ""
-            lines.append(f"- {prefix}{memory['text']}")
-        intro = "Relevant long-term memories from Redis Agent Memory Server. Use silently when helpful; do not force them into the conversation."
-        return "<redis-agent-memory-context>\n" + intro + "\n" + "\n".join(lines) + "\n</redis-agent-memory-context>"
+        return self._format_memories(memories)
+
+    def queue_prefetch(self, query: str, *, session_id: str = "") -> None:
+        if not self._config.get("auto_recall", True) or not query or not self._client:
+            return
+        cache_key = session_id or self._session_id
+        if not cache_key:
+            return
+        if self._prefetch_thread and self._prefetch_thread.is_alive():
+            return
+
+        def _prefetch() -> None:
+            try:
+                memories = self._search(query, limit=self._config.get("max_recall_results", 8))
+                block = self._format_memories(memories)
+                if block:
+                    self._prefetch_results[cache_key] = block
+            except Exception as exc:
+                logger.debug("Redis Agent Memory queued prefetch failed: %s", exc)
+
+        self._prefetch_thread = threading.Thread(target=_prefetch, daemon=True, name="redis-agent-memory-prefetch")
+        self._prefetch_thread.start()
 
     def sync_turn(
         self,
@@ -510,7 +643,8 @@ class RedisAgentMemoryProvider(MemoryProvider):
         def _sync():
             try:
                 logger.info("Redis Agent Memory sync request: %s", _sync_payload_log_details(payload))
-                self._client.put_working_memory(sid, payload)
+                self._enqueue_working_memory(sid, payload)
+                self._flush_pending_writes()
             except Exception as exc:
                 logger.warning("Redis Agent Memory sync failed: %s; request: %s", exc, _sync_payload_log_details(payload))
 
@@ -622,6 +756,8 @@ class RedisAgentMemoryProvider(MemoryProvider):
         return tool_error(f"Unknown tool: {tool_name}")
 
     def shutdown(self) -> None:
+        if self._prefetch_thread and self._prefetch_thread.is_alive():
+            self._prefetch_thread.join(timeout=5.0)
         for thread in list(self._sync_threads):
             if thread.is_alive():
                 thread.join(timeout=5.0)

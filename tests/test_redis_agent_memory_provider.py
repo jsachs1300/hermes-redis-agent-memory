@@ -53,6 +53,15 @@ class FakeMemoryClient:
         self.deleted.extend(memory_ids)
         return {"deleted": len(memory_ids)}
 
+    def health(self):
+        return {"status": "ok"}
+
+    def get_long_term_memory(self, memory_id):
+        return {"id": memory_id, "text": "stored memory", "topics": ["hermes"]}
+
+    def update_long_term_memory(self, memory_id, **kwargs):
+        return {"id": memory_id, **kwargs}
+
 
 def test_provider_loads_config_from_env_and_profile_file(tmp_path, monkeypatch):
     from hermes_redis_agent_memory import RedisAgentMemoryProvider
@@ -215,3 +224,64 @@ def test_tool_schemas_and_tool_calls_search_remember_forget(tmp_path):
     forget_result = json.loads(provider.handle_tool_call("redis_memory_forget", {"memory_id": "m1"}))
     assert forget_result["deleted"] == 1
     assert fake.deleted == ["m1"]
+
+
+def test_non_primary_agent_context_suppresses_writes_but_allows_recall(tmp_path):
+    from hermes_redis_agent_memory import RedisAgentMemoryProvider
+
+    fake = FakeMemoryClient()
+    provider = RedisAgentMemoryProvider(client_factory=lambda config: fake)
+    provider.initialize("cron-session", hermes_home=str(tmp_path), user_id="john", agent_context="cron", platform="cron")
+
+    assert "John works at Redis" in provider.prefetch("redis", session_id="cron-session")
+    provider.sync_turn("cron prompt", "cron response", session_id="cron-session")
+    provider.on_memory_write("add", "user", "Cron-only synthetic fact")
+    provider.shutdown()
+
+    assert fake.working_memory_puts == []
+    assert fake.created == []
+
+
+def test_on_session_switch_updates_cached_session_id_and_clears_prefetch(tmp_path):
+    from hermes_redis_agent_memory import RedisAgentMemoryProvider
+
+    fake = FakeMemoryClient()
+    provider = RedisAgentMemoryProvider(client_factory=lambda config: fake)
+    provider.initialize("old_session", hermes_home=str(tmp_path), user_id="john")
+    provider._prefetch_results["old_session"] = "stale"
+
+    provider.on_session_switch("new_session", parent_session_id="old_session", reset=True)
+    provider.sync_turn("hello", "hi", session_id="")
+    provider.shutdown()
+
+    assert provider._session_id == "new_session"
+    assert provider._prefetch_results == {}
+    session_id, payload = fake.working_memory_puts[0]
+    assert session_id == "new-session"
+    assert payload["original_session_id"] == "new_session"
+    assert payload["parent_session_id"] == "old_session"
+
+
+def test_sync_turn_accepts_messages_keyword(tmp_path):
+    from hermes_redis_agent_memory import RedisAgentMemoryProvider
+
+    fake = FakeMemoryClient()
+    provider = RedisAgentMemoryProvider(client_factory=lambda config: fake)
+    provider.initialize("session-1", hermes_home=str(tmp_path), user_id="john")
+
+    provider.sync_turn("hello", "hi", session_id="session-1", messages=[{"role": "user", "content": "hello"}])
+    provider.shutdown()
+
+    assert len(fake.working_memory_puts) == 1
+
+
+def test_search_mode_is_forwarded_to_client(tmp_path):
+    from hermes_redis_agent_memory import RedisAgentMemoryProvider
+
+    fake = FakeMemoryClient()
+    provider = RedisAgentMemoryProvider(client_factory=lambda config: fake)
+    provider.initialize("session-1", hermes_home=str(tmp_path), user_id="john")
+
+    provider.handle_tool_call("redis_memory_search", {"query": "redis", "search_mode": "keyword"})
+
+    assert fake.search_calls[-1]["search_mode"] == "keyword"

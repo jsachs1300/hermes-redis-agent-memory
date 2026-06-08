@@ -330,8 +330,11 @@ class RedisAgentMemoryProvider(MemoryProvider):
         self._client = None
         self._config: dict[str, Any] = {}
         self._session_id = ""
+        self._parent_session_id = ""
         self._user_id = _DEFAULT_USER_ID
         self._namespace = _DEFAULT_NAMESPACE
+        self._writes_enabled = True
+        self._prefetch_results: dict[str, str] = {}
         self._sync_threads: list[threading.Thread] = []
 
     @property
@@ -348,6 +351,10 @@ class RedisAgentMemoryProvider(MemoryProvider):
         if not self._config.get("base_url"):
             self._config["base_url"] = _DEFAULT_BASE_URL
         self._session_id = session_id
+        self._parent_session_id = str(kwargs.get("parent_session_id") or "")
+        agent_context = str(kwargs.get("agent_context") or "primary").lower()
+        platform = str(kwargs.get("platform") or "").lower()
+        self._writes_enabled = agent_context == "primary" and platform != "cron"
         identity = str(kwargs.get("agent_identity") or "default")
         raw_namespace = str(self._config.get("namespace") or _DEFAULT_NAMESPACE)
         self._namespace = _sanitize_namespace(raw_namespace.format(identity=identity))
@@ -476,14 +483,22 @@ class RedisAgentMemoryProvider(MemoryProvider):
         intro = "Relevant long-term memories from Redis Agent Memory Server. Use silently when helpful; do not force them into the conversation."
         return "<redis-agent-memory-context>\n" + intro + "\n" + "\n".join(lines) + "\n</redis-agent-memory-context>"
 
-    def sync_turn(self, user_content: str, assistant_content: str, *, session_id: str = "") -> None:
-        if not self._client or not self._config.get("auto_sync_turns", True):
+    def sync_turn(
+        self,
+        user_content: str,
+        assistant_content: str,
+        *,
+        session_id: str = "",
+        messages: Optional[List[Dict[str, Any]]] = None,
+    ) -> None:
+        if not self._client or not self._config.get("auto_sync_turns", True) or not self._writes_enabled:
             return
         sid = _sanitize_session_id(session_id or self._session_id)
         original_sid = session_id or self._session_id
         payload = {
             "session_id": sid,
             "original_session_id": original_sid,
+            "parent_session_id": self._parent_session_id,
             "user_id": self._user_id,
             "namespace": self._namespace,
             "messages": [
@@ -526,7 +541,7 @@ class RedisAgentMemoryProvider(MemoryProvider):
         return self._client.create_long_term_memory([memory])
 
     def on_memory_write(self, action: str, target: str, content: str, metadata: Optional[Dict[str, Any]] = None) -> None:
-        if action != "add" or not content or not self._client:
+        if action != "add" or not content or not self._client or not self._writes_enabled:
             return
         topics = ["hermes", target or "memory"]
 
@@ -542,6 +557,22 @@ class RedisAgentMemoryProvider(MemoryProvider):
 
     def get_tool_schemas(self) -> List[Dict[str, Any]]:
         return [SEARCH_SCHEMA, REMEMBER_SCHEMA, FORGET_SCHEMA]
+
+    def on_session_switch(
+        self,
+        new_session_id: str,
+        *,
+        parent_session_id: str = "",
+        reset: bool = False,
+        rewound: bool = False,
+        **kwargs,
+    ) -> None:
+        if not new_session_id:
+            return
+        self._session_id = new_session_id
+        self._parent_session_id = str(parent_session_id or "")
+        if reset or rewound:
+            self._prefetch_results.clear()
 
     def handle_tool_call(self, tool_name: str, args: Dict[str, Any], **kwargs) -> str:
         if tool_name == "redis_memory_search":

@@ -63,10 +63,13 @@ class FakeMemoryClient:
         return {"status": "ok"}
 
     def get_long_term_memory(self, memory_id):
-        return {"id": memory_id, "text": "stored memory", "topics": ["hermes"]}
+        return {"id": memory_id, "text": "details"}
 
     def update_long_term_memory(self, memory_id, **kwargs):
-        return {"id": memory_id, **kwargs}
+        self.updated = getattr(self, "updated", [])
+        self.updated.append((memory_id, kwargs))
+        return {"id": memory_id, "updated": True, **kwargs}
+
 
 
 def test_provider_loads_config_from_env_and_profile_file(tmp_path, monkeypatch):
@@ -430,3 +433,56 @@ def test_memory_write_remove_deletes_mapped_memory(tmp_path):
 
     assert "m10" in fake.deleted
     assert provider._lookup_mirrored_memory_id("memory", "temporary fact") == ""
+
+
+def test_forget_tool_normalizes_list_delete_responses(tmp_path):
+    from hermes_redis_agent_memory import RedisAgentMemoryProvider
+
+    class ListDeleteClient(FakeMemoryClient):
+        def delete_long_term_memories(self, memory_ids):
+            self.deleted.extend(memory_ids)
+            return {"deleted": memory_ids}
+
+    fake = ListDeleteClient()
+    provider = RedisAgentMemoryProvider(client_factory=lambda config: fake)
+    provider.initialize("session-1", hermes_home=str(tmp_path), user_id="john")
+
+    result = json.loads(provider.handle_tool_call("redis_memory_forget", {"memory_id": "m1"}))
+
+    assert result["deleted"] == 1
+    assert result["memory_ids"] == ["m1"]
+
+
+def test_get_and_update_by_id_tools(tmp_path):
+    from hermes_redis_agent_memory import RedisAgentMemoryProvider
+
+    fake = FakeMemoryClient()
+    provider = RedisAgentMemoryProvider(client_factory=lambda config: fake)
+    provider.initialize("session-1", hermes_home=str(tmp_path), user_id="john")
+
+    got = json.loads(provider.handle_tool_call("redis_memory_get", {"memory_id": "m1"}))
+    updated = json.loads(provider.handle_tool_call(
+        "redis_memory_update",
+        {"memory_id": "m1", "content": "updated details", "topics": ["hermes", "edited"]},
+    ))
+
+    assert got["memory"]["text"] == "details"
+    assert fake.updated == [("m1", {"text": "updated details", "topics": ["hermes", "edited"]})]
+    assert updated["updated"] is True
+
+
+def test_completed_threads_are_pruned_before_starting_more(tmp_path):
+    from hermes_redis_agent_memory import RedisAgentMemoryProvider
+
+    fake = FakeMemoryClient()
+    provider = RedisAgentMemoryProvider(client_factory=lambda config: fake)
+    provider.initialize("session-1", hermes_home=str(tmp_path), user_id="john")
+
+    for idx in range(5):
+        provider.on_memory_write("add", "memory", f"fact {idx}")
+        provider.shutdown()
+
+    provider.on_memory_write("add", "memory", "fact 6")
+    provider.shutdown()
+
+    assert len(provider._sync_threads) == 0

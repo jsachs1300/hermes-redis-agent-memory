@@ -280,6 +280,26 @@ class _RedisAMSClient:
     def delete_long_term_memories(self, memory_ids: list[str]):
         return self._to_plain(self._client.bulk_delete_long_term_memories(memory_ids=memory_ids))
 
+    def get_long_term_memory(self, memory_id: str):
+        return self._to_plain(self._client.get_long_term_memory(memory_id=memory_id))
+
+    def update_long_term_memory(self, memory_id: str, **kwargs):
+        models = self._models
+        call_kwargs = {"memory_id": memory_id}
+        if kwargs.get("text") is not None:
+            call_kwargs["text"] = kwargs["text"]
+        if kwargs.get("memory_type"):
+            call_kwargs["memory_type"] = models.MemoryType(kwargs["memory_type"])
+        if kwargs.get("topics") is not None:
+            call_kwargs["topics"] = kwargs["topics"]
+        if kwargs.get("namespace") is not None:
+            call_kwargs["namespace"] = kwargs["namespace"]
+        if kwargs.get("owner_id") is not None:
+            call_kwargs["owner_id"] = kwargs["owner_id"]
+        if kwargs.get("session_id") is not None:
+            call_kwargs["session_id"] = kwargs["session_id"]
+        return self._to_plain(self._client.update_long_term_memory(**call_kwargs))
+
     def close(self):
         close = getattr(self._client, "close", None)
         if callable(close):
@@ -322,6 +342,33 @@ FORGET_SCHEMA = {
         "type": "object",
         "properties": {
             "memory_id": {"type": "string", "description": "The memory ID to delete."},
+        },
+        "required": ["memory_id"],
+    },
+}
+
+GET_SCHEMA = {
+    "name": "redis_memory_get",
+    "description": "Inspect a Redis Agent Memory Server long-term memory by ID.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "memory_id": {"type": "string", "description": "The memory ID to inspect."},
+        },
+        "required": ["memory_id"],
+    },
+}
+
+UPDATE_SCHEMA = {
+    "name": "redis_memory_update",
+    "description": "Update a Redis Agent Memory Server long-term memory by ID. Only supplied fields are changed.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "memory_id": {"type": "string", "description": "The memory ID to update."},
+            "content": {"type": "string", "description": "Replacement memory text."},
+            "memory_type": {"type": "string", "enum": ["semantic", "episodic", "message"], "description": "Optional memory type update."},
+            "topics": {"type": "array", "items": {"type": "string"}, "description": "Optional replacement topics."},
         },
         "required": ["memory_id"],
     },
@@ -566,7 +613,14 @@ class RedisAgentMemoryProvider(MemoryProvider):
                         break
 
     def _flush_pending_writes_async(self) -> None:
-        thread = threading.Thread(target=self._flush_pending_writes, daemon=True, name="redis-agent-memory-queue-flush")
+        self._start_thread(self._flush_pending_writes, "redis-agent-memory-queue-flush")
+
+    def _prune_threads(self) -> None:
+        self._sync_threads = [thread for thread in self._sync_threads if thread.is_alive()]
+
+    def _start_thread(self, target: Callable[[], None], name: str) -> None:
+        self._prune_threads()
+        thread = threading.Thread(target=target, daemon=True, name=name)
         self._sync_threads.append(thread)
         thread.start()
 
@@ -711,9 +765,7 @@ class RedisAgentMemoryProvider(MemoryProvider):
             except Exception as exc:
                 logger.warning("Redis Agent Memory sync failed: %s; request: %s", exc, _sync_payload_log_details(payload))
 
-        thread = threading.Thread(target=_sync, daemon=True, name="redis-agent-memory-sync")
-        self._sync_threads.append(thread)
-        thread.start()
+        self._start_thread(_sync, "redis-agent-memory-sync")
 
     @staticmethod
     def _created_memory_ids(response: Any) -> list[str]:
@@ -791,9 +843,7 @@ class RedisAgentMemoryProvider(MemoryProvider):
                 except Exception as exc:
                     logger.warning("Redis Agent Memory mirror remove failed: %s", exc)
 
-            thread = threading.Thread(target=_remove, daemon=True, name="redis-agent-memory-mirror-remove")
-            self._sync_threads.append(thread)
-            thread.start()
+            self._start_thread(_remove, "redis-agent-memory-mirror-remove")
             return
 
         if action == "replace":
@@ -816,9 +866,7 @@ class RedisAgentMemoryProvider(MemoryProvider):
                 except Exception as exc:
                     logger.warning("Redis Agent Memory mirror replace failed: %s", exc)
 
-            thread = threading.Thread(target=_replace, daemon=True, name="redis-agent-memory-mirror-replace")
-            self._sync_threads.append(thread)
-            thread.start()
+            self._start_thread(_replace, "redis-agent-memory-mirror-replace")
             return
 
         if action != "add" or not content:
@@ -834,12 +882,10 @@ class RedisAgentMemoryProvider(MemoryProvider):
             except Exception as exc:
                 logger.warning("Redis Agent Memory mirror failed: %s", exc)
 
-        thread = threading.Thread(target=_sync, daemon=True, name="redis-agent-memory-mirror")
-        self._sync_threads.append(thread)
-        thread.start()
+        self._start_thread(_sync, "redis-agent-memory-mirror")
 
     def get_tool_schemas(self) -> List[Dict[str, Any]]:
-        return [SEARCH_SCHEMA, REMEMBER_SCHEMA, FORGET_SCHEMA, STATUS_SCHEMA]
+        return [SEARCH_SCHEMA, REMEMBER_SCHEMA, FORGET_SCHEMA, GET_SCHEMA, UPDATE_SCHEMA, STATUS_SCHEMA]
 
     def on_session_switch(
         self,
@@ -898,9 +944,42 @@ class RedisAgentMemoryProvider(MemoryProvider):
                     deleted = len(deleted_value) if isinstance(deleted_value, list) else deleted_value
                 else:
                     deleted = 1
-                return json.dumps({"deleted": deleted, "response": response})
+                return json.dumps({"deleted": deleted, "memory_ids": [memory_id], "response": response})
             except Exception as exc:
                 return tool_error(f"Redis Agent Memory forget failed: {exc}")
+
+        if tool_name == "redis_memory_get":
+            memory_id = str(args.get("memory_id") or "").strip()
+            if not memory_id:
+                return tool_error("Missing required parameter: memory_id")
+            try:
+                response = self._client.get_long_term_memory(memory_id)
+                return json.dumps({"memory": response})
+            except Exception as exc:
+                return tool_error(f"Redis Agent Memory get failed: {exc}")
+
+        if tool_name == "redis_memory_update":
+            memory_id = str(args.get("memory_id") or "").strip()
+            if not memory_id:
+                return tool_error("Missing required parameter: memory_id")
+            update_args: dict[str, Any] = {}
+            content = str(args.get("content") or "").strip()
+            if content:
+                update_args["text"] = content
+            memory_type = str(args.get("memory_type") or "").strip()
+            if memory_type:
+                if memory_type not in {"semantic", "episodic", "message"}:
+                    return tool_error("memory_type must be semantic, episodic, or message")
+                update_args["memory_type"] = memory_type
+            if isinstance(args.get("topics"), list):
+                update_args["topics"] = [str(topic) for topic in args["topics"]]
+            if not update_args:
+                return tool_error("No update fields provided. Supply content, memory_type, or topics.")
+            try:
+                response = self._client.update_long_term_memory(memory_id, **update_args)
+                return json.dumps({"updated": True, "memory": response})
+            except Exception as exc:
+                return tool_error(f"Redis Agent Memory update failed: {exc}")
 
         if tool_name == "redis_memory_status":
             return json.dumps({

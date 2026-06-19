@@ -209,6 +209,7 @@ This release adds support for the expanded batch memory management tools introdu
 - Batch create and delete delegate directly to the `redis-agent-memory` SDK bulk methods.
 - Batch update falls back to serial per-ID calls inside the provider (still atomic from Hermes perspective).
 - All batch tools respect the same config (namespace, user_id, writes_enabled gating, circuit breaker).
+- Mutating batch tools (remember/forget/update + _batch) are rejected with an error when `_writes_enabled=False` (cron/subagent contexts).
 - Logging and error handling mirror the single-item paths.
 - Tests extended with `test_batch_remember_forget_update_tools`.
 

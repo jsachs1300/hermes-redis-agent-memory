@@ -527,3 +527,27 @@ def test_batch_remember_forget_update_tools(tmp_path):
     assert len(update_batch.get("results", [])) + len(update_batch.get("errors", [])) > 0
 
     print("Batch tools test passed")
+
+
+def test_batch_tools_respect_write_gate(tmp_path):
+    from hermes_redis_agent_memory import RedisAgentMemoryProvider
+
+    fake = FakeMemoryClient()
+    provider = RedisAgentMemoryProvider(client_factory=lambda config: fake)
+    # cron context disables writes
+    provider.initialize("cron-session", hermes_home=str(tmp_path), user_id="john", agent_context="cron", platform="cron")
+
+    # All mutating batch ops should be rejected
+    for tool, args in [
+        ("redis_memory_remember_batch", {"memories": [{"content": "should be blocked"}]}),
+        ("redis_memory_forget_batch", {"memory_ids": ["m1"]}),
+        ("redis_memory_update_batch", {"updates": [{"memory_id": "m1", "content": "x"}]}),
+    ]:
+        res = json.loads(provider.handle_tool_call(tool, args))
+        assert "error" in res
+        assert "disabled" in res["error"].lower(), f"{tool} should mention disabled writes"
+
+    # Non-mutating should still work
+    search = json.loads(provider.handle_tool_call("redis_memory_search", {"query": "test"}))
+    assert "results" in search or "error" not in search
+    print("Write gate test for batch tools passed")

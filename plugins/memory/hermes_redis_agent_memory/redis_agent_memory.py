@@ -930,8 +930,9 @@ class RedisAgentMemoryProvider(MemoryProvider):
                 "memory_type": memory_type,
                 "topics": mem.get("topics") or ["hermes", "batch"],
                 "entities": mem.get("entities") or [],
-                "user_id": self._user_id,
-                "namespace": self._namespace,
+                "user_id": mem.get("owner_id") or mem.get("user_id") or self._user_id,
+                "namespace": mem.get("namespace") or self._namespace,
+                "session_id": mem.get("session_id"),
             }
             records.append(record)
 
@@ -1051,6 +1052,8 @@ class RedisAgentMemoryProvider(MemoryProvider):
                 return tool_error(f"Redis Agent Memory search failed: {exc}")
 
         if tool_name == "redis_memory_remember":
+            if not self._writes_enabled:
+                return tool_error("Writes are disabled for this agent context")
             content = str(args.get("content") or "").strip()
             if not content:
                 return tool_error("Missing required parameter: content")
@@ -1068,6 +1071,8 @@ class RedisAgentMemoryProvider(MemoryProvider):
                 return tool_error(f"Redis Agent Memory remember failed: {exc}")
 
         if tool_name == "redis_memory_remember_batch":
+            if not self._writes_enabled:
+                return tool_error("Writes are disabled for this agent context")
             memories = args.get("memories")
             if not isinstance(memories, list) or len(memories) == 0:
                 return tool_error("Missing or empty 'memories' list for batch remember")
@@ -1079,6 +1084,8 @@ class RedisAgentMemoryProvider(MemoryProvider):
 
 
         if tool_name == "redis_memory_forget":
+            if not self._writes_enabled:
+                return tool_error("Writes are disabled for this agent context")
             memory_id = str(args.get("memory_id") or "").strip()
             if not memory_id:
                 return tool_error("Missing required parameter: memory_id")
@@ -1095,6 +1102,8 @@ class RedisAgentMemoryProvider(MemoryProvider):
                 return tool_error(f"Redis Agent Memory forget failed: {exc}")
 
         if tool_name == "redis_memory_forget_batch":
+            if not self._writes_enabled:
+                return tool_error("Writes are disabled for this agent context")
             memory_ids = args.get("memory_ids")
             if not isinstance(memory_ids, list) or len(memory_ids) == 0:
                 return tool_error("Missing or empty 'memory_ids' list for batch forget")
@@ -1122,6 +1131,8 @@ class RedisAgentMemoryProvider(MemoryProvider):
                 return tool_error(f"Redis Agent Memory get failed: {exc}")
 
         if tool_name == "redis_memory_update":
+            if not self._writes_enabled:
+                return tool_error("Writes are disabled for this agent context")
             memory_id = str(args.get("memory_id") or "").strip()
             if not memory_id:
                 return tool_error("Missing required parameter: memory_id")
@@ -1145,6 +1156,8 @@ class RedisAgentMemoryProvider(MemoryProvider):
                 return tool_error(f"Redis Agent Memory update failed: {exc}")
 
         if tool_name == "redis_memory_update_batch":
+            if not self._writes_enabled:
+                return tool_error("Writes are disabled for this agent context")
             updates = args.get("updates")
             if not isinstance(updates, list) or len(updates) == 0:
                 return tool_error("Missing or empty 'updates' list for batch update")

@@ -1,9 +1,18 @@
 """Redis Agent Memory Server provider for Hermes Agent.
 
 This module implements the Hermes MemoryProvider interface against Redis Agent
-Memory Server (AMS).  The initial provider intentionally keeps the integration
-small: long-term-memory recall, working-memory turn sync, explicit remember /
-search / forget tools, and mirroring of built-in Hermes memory writes.
+Memory Server (AMS).
+
+Core features:
+- Long-term memory recall via hybrid search
+- Working memory turn sync
+- Explicit remember/search/forget/get/update tools
+- Mirroring of built-in Hermes memory writes with provenance
+- Batch variants of remember/forget/update for efficient bulk operations
+  (added to support Hermes expanded memory management tool with batch save/edit/remove)
+
+The provider wraps the official redis-agent-memory SDK (HTTP to AMS) and
+exposes both single-item and batch tool schemas.
 """
 
 from __future__ import annotations
@@ -380,6 +389,84 @@ STATUS_SCHEMA = {
     "parameters": {"type": "object", "properties": {}},
 }
 
+REMEMBER_BATCH_SCHEMA = {
+    "name": "redis_memory_remember_batch",
+    "description": (
+        "Batch version of redis_memory_remember. Store multiple explicit long-term memories "
+        "in a single tool call. This reduces the number of turns/tool calls required for bulk "
+        "memory ingestion. Each entry in the list follows the same shape as the single-item remember tool."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "memories": {
+                "type": "array",
+                "description": "List of memory records to create.",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "content": {"type": "string", "description": "The durable fact, preference, event, or note to remember."},
+                        "memory_type": {"type": "string", "enum": ["semantic", "episodic", "message"], "description": "Memory type. Defaults to semantic."},
+                        "topics": {"type": "array", "items": {"type": "string"}, "description": "Optional topics for filtering."},
+                        "entities": {"type": "array", "items": {"type": "string"}, "description": "Optional entities for filtering."},
+                    },
+                    "required": ["content"],
+                },
+            },
+        },
+        "required": ["memories"],
+    },
+}
+
+FORGET_BATCH_SCHEMA = {
+    "name": "redis_memory_forget_batch",
+    "description": (
+        "Batch version of redis_memory_forget. Delete multiple long-term memories by ID "
+        "in one call using the SDK's bulk delete endpoint. Returns aggregated delete count."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "memory_ids": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "List of memory IDs to delete.",
+            },
+        },
+        "required": ["memory_ids"],
+    },
+}
+
+UPDATE_BATCH_SCHEMA = {
+    "name": "redis_memory_update_batch",
+    "description": (
+        "Batch version of redis_memory_update. Update multiple memories. Each update requires "
+        "a memory_id plus at least one of content/memory_type/topics. Because the AMS SDK "
+        "provides only per-ID update (no bulk_update endpoint), the provider loops over the "
+        "list while still exposing a single tool call surface to Hermes/agents."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "updates": {
+                "type": "array",
+                "description": "List of update specifications.",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "memory_id": {"type": "string", "description": "The memory ID to update."},
+                        "content": {"type": "string", "description": "Replacement memory text."},
+                        "memory_type": {"type": "string", "enum": ["semantic", "episodic", "message"], "description": "Optional memory type update."},
+                        "topics": {"type": "array", "items": {"type": "string"}, "description": "Optional replacement topics."},
+                    },
+                    "required": ["memory_id"],
+                },
+            },
+        },
+        "required": ["updates"],
+    },
+}
+
 
 class RedisAgentMemoryProvider(MemoryProvider):
     """Hermes memory provider backed by Redis Agent Memory Server."""
@@ -482,7 +569,8 @@ class RedisAgentMemoryProvider(MemoryProvider):
         return (
             "# Redis Agent Memory\n"
             f"Active via Redis Agent Memory Server. User: {self._user_id}. Namespace: {self._namespace}.\n"
-            "Use redis_memory_search for relevant recall and redis_memory_remember for explicit durable facts."
+            "Use redis_memory_search for relevant recall and redis_memory_remember (or the _batch variants) for explicit durable facts. "
+            "Batch tools (remember_batch, forget_batch, update_batch) allow storing/editing/removing many memories in one call."
         )
 
     def _is_circuit_open(self) -> bool:
@@ -822,6 +910,43 @@ class RedisAgentMemoryProvider(MemoryProvider):
         )
         return self._client.create_long_term_memory([memory])
 
+    def _create_memories(self, memories: list[dict]) -> dict:
+        """Batch create multiple long-term memories. Prepares records and calls the SDK bulk create."""
+        if not self._client:
+            raise RuntimeError("Redis Agent Memory client is not initialized")
+        if not memories:
+            return {"created": [], "count": 0}
+
+        records = []
+        for mem in memories:
+            content_text = str(mem.get("content") or "").strip()
+            if not content_text:
+                continue
+            memory_type = str(mem.get("memory_type") or "semantic")
+            if memory_type not in {"semantic", "episodic", "message"}:
+                memory_type = "semantic"
+            record = {
+                "text": content_text,
+                "memory_type": memory_type,
+                "topics": mem.get("topics") or ["hermes", "batch"],
+                "entities": mem.get("entities") or [],
+                "user_id": self._user_id,
+                "namespace": self._namespace,
+            }
+            records.append(record)
+
+        if not records:
+            return {"created": [], "count": 0}
+
+        logger.info(
+            "Redis Agent Memory create_long_term_memories batch request: count=%s user_id=%s namespace=%s",
+            len(records),
+            self._user_id,
+            self._namespace,
+        )
+        response = self._client.create_long_term_memory(records)
+        return {"stored": True, "count": len(records), "response": response}
+
     def on_memory_write(self, action: str, target: str, content: str, metadata: Optional[Dict[str, Any]] = None) -> None:
         if not self._client or not self._writes_enabled:
             return
@@ -885,7 +1010,17 @@ class RedisAgentMemoryProvider(MemoryProvider):
         self._start_thread(_sync, "redis-agent-memory-mirror")
 
     def get_tool_schemas(self) -> List[Dict[str, Any]]:
-        return [SEARCH_SCHEMA, REMEMBER_SCHEMA, FORGET_SCHEMA, GET_SCHEMA, UPDATE_SCHEMA, STATUS_SCHEMA]
+        return [
+            SEARCH_SCHEMA,
+            REMEMBER_SCHEMA,
+            FORGET_SCHEMA,
+            GET_SCHEMA,
+            UPDATE_SCHEMA,
+            STATUS_SCHEMA,
+            REMEMBER_BATCH_SCHEMA,
+            FORGET_BATCH_SCHEMA,
+            UPDATE_BATCH_SCHEMA,
+        ]
 
     def on_session_switch(
         self,
@@ -932,6 +1067,17 @@ class RedisAgentMemoryProvider(MemoryProvider):
             except Exception as exc:
                 return tool_error(f"Redis Agent Memory remember failed: {exc}")
 
+        if tool_name == "redis_memory_remember_batch":
+            memories = args.get("memories")
+            if not isinstance(memories, list) or len(memories) == 0:
+                return tool_error("Missing or empty 'memories' list for batch remember")
+            try:
+                response = self._create_memories(memories)
+                return json.dumps(response)
+            except Exception as exc:
+                return tool_error(f"Redis Agent Memory remember_batch failed: {exc}")
+
+
         if tool_name == "redis_memory_forget":
             memory_id = str(args.get("memory_id") or "").strip()
             if not memory_id:
@@ -947,6 +1093,23 @@ class RedisAgentMemoryProvider(MemoryProvider):
                 return json.dumps({"deleted": deleted, "memory_ids": [memory_id], "response": response})
             except Exception as exc:
                 return tool_error(f"Redis Agent Memory forget failed: {exc}")
+
+        if tool_name == "redis_memory_forget_batch":
+            memory_ids = args.get("memory_ids")
+            if not isinstance(memory_ids, list) or len(memory_ids) == 0:
+                return tool_error("Missing or empty 'memory_ids' list for batch forget")
+            try:
+                logger.info("Redis Agent Memory delete_long_term_memories batch request: memory_ids=%s", memory_ids)
+                response = self._client.delete_long_term_memories(memory_ids)
+                if isinstance(response, dict):
+                    deleted_value = response.get("deleted", len(memory_ids))
+                    deleted = len(deleted_value) if isinstance(deleted_value, list) else deleted_value
+                else:
+                    deleted = len(memory_ids)
+                return json.dumps({"deleted": deleted, "memory_ids": memory_ids, "response": response})
+            except Exception as exc:
+                return tool_error(f"Redis Agent Memory forget_batch failed: {exc}")
+
 
         if tool_name == "redis_memory_get":
             memory_id = str(args.get("memory_id") or "").strip()
@@ -980,6 +1143,45 @@ class RedisAgentMemoryProvider(MemoryProvider):
                 return json.dumps({"updated": True, "memory": response})
             except Exception as exc:
                 return tool_error(f"Redis Agent Memory update failed: {exc}")
+
+        if tool_name == "redis_memory_update_batch":
+            updates = args.get("updates")
+            if not isinstance(updates, list) or len(updates) == 0:
+                return tool_error("Missing or empty 'updates' list for batch update")
+            results = []
+            errors = []
+            for upd in updates:
+                memory_id = str(upd.get("memory_id") or "").strip()
+                if not memory_id:
+                    errors.append({"memory_id": None, "error": "missing memory_id"})
+                    continue
+                update_args = {}
+                content_val = str(upd.get("content") or "").strip()
+                if content_val:
+                    update_args["text"] = content_val
+                memory_type = str(upd.get("memory_type") or "").strip()
+                if memory_type:
+                    if memory_type not in {"semantic", "episodic", "message"}:
+                        errors.append({"memory_id": memory_id, "error": "memory_type must be semantic, episodic, or message"})
+                        continue
+                    update_args["memory_type"] = memory_type
+                if isinstance(upd.get("topics"), list):
+                    update_args["topics"] = [str(topic) for topic in upd["topics"]]
+                if not update_args:
+                    errors.append({"memory_id": memory_id, "error": "No update fields provided"})
+                    continue
+                try:
+                    resp = self._client.update_long_term_memory(memory_id, **update_args)
+                    results.append({"memory_id": memory_id, "updated": True, "response": resp})
+                except Exception as e:
+                    errors.append({"memory_id": memory_id, "error": str(e)})
+            return json.dumps({
+                "updated_count": len(results),
+                "results": results,
+                "errors": errors,
+                "total": len(updates)
+            })
+
 
         if tool_name == "redis_memory_status":
             return json.dumps({

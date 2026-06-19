@@ -221,6 +221,7 @@ def test_tool_schemas_and_tool_calls_search_remember_forget(tmp_path):
 
     tool_names = {schema["name"] for schema in provider.get_tool_schemas()}
     assert {"redis_memory_search", "redis_memory_remember", "redis_memory_forget"}.issubset(tool_names)
+    assert {"redis_memory_remember_batch", "redis_memory_forget_batch", "redis_memory_update_batch"}.issubset(tool_names)
 
     search_result = json.loads(provider.handle_tool_call("redis_memory_search", {"query": "redis", "limit": 2}))
     assert search_result["count"] == 2
@@ -486,3 +487,43 @@ def test_completed_threads_are_pruned_before_starting_more(tmp_path):
     provider.shutdown()
 
     assert len(provider._sync_threads) == 0
+
+
+def test_batch_remember_forget_update_tools(tmp_path):
+    from hermes_redis_agent_memory import RedisAgentMemoryProvider
+
+    fake = FakeMemoryClient()
+    provider = RedisAgentMemoryProvider(client_factory=lambda config: fake)
+    provider.initialize("session-1", hermes_home=str(tmp_path), user_id="john")
+
+    # Batch remember
+    remember_batch = json.loads(provider.handle_tool_call(
+        "redis_memory_remember_batch",
+        {"memories": [
+            {"content": "Batch fact 1 about chess."},
+            {"content": "Batch fact 2 about Redis.", "topics": ["work", "redis"]},
+        ]}
+    ))
+    assert remember_batch.get("stored") is True or "count" in remember_batch
+    assert len(fake.created) >= 2
+
+    # Batch forget
+    forget_batch = json.loads(provider.handle_tool_call(
+        "redis_memory_forget_batch",
+        {"memory_ids": ["m1", "m2"]}
+    ))
+    assert forget_batch["deleted"] == 2 or forget_batch.get("deleted") >= 1
+    assert "m1" in fake.deleted and "m2" in fake.deleted
+
+    # Batch update
+    update_batch = json.loads(provider.handle_tool_call(
+        "redis_memory_update_batch",
+        {"updates": [
+            {"memory_id": "m10", "content": "Updated batch fact"},
+            {"memory_id": "m11", "topics": ["updated", "batch"]},
+        ]}
+    ))
+    assert update_batch["updated_count"] >= 1
+    assert len(update_batch.get("results", [])) + len(update_batch.get("errors", [])) > 0
+
+    print("Batch tools test passed")
